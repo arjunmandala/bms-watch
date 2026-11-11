@@ -68,3 +68,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow disable poll.yml --repo "${{ github.repository }}"
+      - name: Chain next live run (GitHub cron is unreliable)
+        if: always() && steps.live.outputs.posted != 'true' && ((github.event_name == 'schedule' && vars.LIVE == '1') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date +%s)" -ge 1794735000 ]; then echo "past stop time"; exit 0; fi
+          if [ "${{ steps.live.outcome }}" != "success" ]; then sleep 120; fi
+          gh workflow run poll.yml --repo "${{ github.repository }}" -f mode=live
+          echo "next run dispatched"
