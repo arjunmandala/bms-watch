@@ -1,0 +1,45 @@
+name: bms-poll
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'test (no POST) or live'
+        default: 'test'
+        type: choice
+        options: [test, live]
+      extra:
+        description: 'extra dates for test mode, comma-separated'
+        default: ''
+concurrency:
+  group: bms-poll
+  cancel-in-progress: false
+permissions:
+  actions: write
+  contents: read
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Test (no webhook)
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'test'
+        run: python poll.py --test --extra "${{ inputs.extra }}"
+      - name: Live poll
+        id: live
+        if: (github.event_name == 'schedule' && vars.LIVE == '1') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live')
+        env:
+          WEBHOOK_KEY: ${{ secrets.WEBHOOK_KEY }}
+        run: python poll.py --duration 270 --interval 45
+      - name: Disable after successful POST
+        if: steps.live.outputs.posted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable poll.yml --repo "${{ github.repository }}"
