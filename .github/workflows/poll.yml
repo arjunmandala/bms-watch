@@ -1,7 +1,7 @@
 name: bms-poll
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '2-59/20 * * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -23,6 +23,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
+      - name: Stop after Sun 15 Nov 2026 15:00 IST
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date +%s)" -ge 1794735000 ]; then
+            gh workflow disable poll.yml --repo "${{ github.repository }}"; echo "past stop time, disabled"; exit 1
+          fi
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -55,7 +62,7 @@ jobs:
         if: (github.event_name == 'schedule' && vars.LIVE == '1') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live')
         env:
           WEBHOOK_KEY: ${{ secrets.WEBHOOK_KEY }}
-        run: python poll.py --duration 230 --interval 45
+        run: python poll.py --duration 200 --interval 45
       - name: Disable after successful POST
         if: steps.live.outputs.posted == 'true'
         env:
