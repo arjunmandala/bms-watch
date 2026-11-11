@@ -21,31 +21,58 @@ def log(msg):
     print(f"{now_ist().isoformat(timespec='seconds')} {msg}", flush=True)
 
 
+PROXY = os.environ.get("BMS_PROXY", "").strip()  # Cloudflare WARP socks proxy on the runner
+LAST_ROUTE = [None]
+
+
 def new_session():
     return Session(impersonate="chrome")
 
 
+def _parse(text):
+    """Accept raw JSON or the r.jina.ai wrapper (header lines, then the JSON body)."""
+    i = text.find("{")
+    if i < 0:
+        raise ValueError("no JSON in body")
+    return json.JSONDecoder().raw_decode(text[i:])[0]
+
+
+def _get(session, route, url):
+    if route == "warp":
+        return session.get(url, timeout=20, proxies={"http": PROXY, "https": PROXY})
+    if route == "jina":
+        return session.get("https://r.jina.ai/" + url, timeout=40, headers={"x-no-cache": "true"})
+    return session.get(url, timeout=20)
+
+
 def fetch(session_box, date_code):
+    """Routes: WARP proxy (BMS blocks GitHub/Azure IPs directly), then direct, then r.jina.ai relay."""
     url = f"https://in.bookmyshow.com/api/v2/mobile/showtimes/byvenue?venueCode={VENUE}&dateCode={date_code}"
-    last = None
-    for attempt in range(3):
-        status = None
-        try:
-            resp = session_box[0].get(url, timeout=20)
-            status = resp.status_code
-            text = resp.text or ""
-            if not text.strip():
-                raise ValueError("empty body")
-            return status, resp.json()
-        except Exception as exc:
-            last = f"status={status} {type(exc).__name__}: {str(exc)[:200]}"
+    routes = (["warp"] if PROXY else []) + ["direct", "jina"]
+    last, status = None, None
+    for attempt in range(2):
+        for route in routes:
+            status = None
             try:
-                session_box[0].close()
-            except Exception:
-                pass
-            session_box[0] = new_session()
-            if attempt < 2:
-                time.sleep(random.uniform(3, 8))
+                resp = _get(session_box[0], route, url)
+                status = resp.status_code
+                if status != 200:
+                    raise ValueError(f"HTTP {status}")
+                data = _parse(resp.text or "")
+                if "ShowDatesArray" not in data:
+                    raise ValueError("unexpected JSON")
+                LAST_ROUTE[0] = route
+                return status, data
+            except Exception as exc:
+                last = f"route={route} status={status} {type(exc).__name__}: {str(exc)[:160]}"
+                log(f"{date_code} fetch failed {last}")
+                try:
+                    session_box[0].close()
+                except Exception:
+                    pass
+                session_box[0] = new_session()
+        if attempt < 1:
+            time.sleep(random.uniform(3, 8))
     return status, {"_error": last}
 
 
@@ -142,11 +169,21 @@ def main():
             if not err:
                 det = data.get("ShowDetails") or []
                 returned = det[0].get("Date") if det else None
-            summary[d] = {"status": status, "error": err, "returned_date": returned, "open": a["open"],
+            summary[d] = {"status": status, "route": LAST_ROUTE[0] if not err else None, "error": err, "returned_date": returned, "open": a["open"],
                           "ramayana_hindi_shows": a["ramayana_hindi"], "matches_1430_1530": len(a["matches"]),
                           "match_times": [f'{m["time"]} {m["screen"]} {m["format"]}' for m in a["matches"]]}
             log(f"TEST {d}: {json.dumps(summary[d])}")
         print("TEST_SUMMARY " + json.dumps(summary))
+        # exercise every route individually against the first date given via --extra (positive control)
+        ctrl = ([d for d in args.extra.split(",") if d] or TARGET_DATES)[0]
+        url = f"https://in.bookmyshow.com/api/v2/mobile/showtimes/byvenue?venueCode={VENUE}&dateCode={ctrl}"
+        for route in (["warp"] if PROXY else []) + ["direct", "jina"]:
+            try:
+                resp = _get(new_session(), route, url)
+                a = analyze(_parse(resp.text), ctrl) if resp.status_code == 200 else {"open": None, "matches": []}
+                log(f"ROUTE {route} {ctrl}: status={resp.status_code} open={a['open']} matches={len(a['matches'])}")
+            except Exception as exc:
+                log(f"ROUTE {route} {ctrl}: {type(exc).__name__}: {str(exc)[:160]}")
         ok = all(v["status"] == 200 and not v["error"] for v in summary.values())
         return 0 if ok else 1
 
@@ -163,7 +200,7 @@ def main():
                 log(f"{d} fetch error {data['_error']}")
                 continue
             a = analyze(data, d)
-            log(f"{d} status={status} open={a['open']} ramayana_hindi={a['ramayana_hindi']} matches={len(a['matches'])}")
+            log(f"{d} status={status} route={LAST_ROUTE[0]} open={a['open']} ramayana_hindi={a['ramayana_hindi']} matches={len(a['matches'])}")
             if a["matches"]:
                 body = {"source": "github", "event": "ramayana_show_listed", "venue": VENUE, "date": d,
                         "detected_at": now_ist().isoformat(timespec="seconds"), "shows": a["matches"]}

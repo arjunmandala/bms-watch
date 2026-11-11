@@ -29,6 +29,24 @@ jobs:
           python-version: '3.12'
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Cloudflare WARP proxy (BMS blocks GitHub IPs)
+        continue-on-error: true
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+          sudo apt-get update -qq -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/cloudflare-client.list -o Dir::Etc::sourceparts=- && sudo apt-get install -y -qq cloudflare-warp >/dev/null
+          sleep 3
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos proxy port 40000
+          warp-cli --accept-tos connect
+          for i in $(seq 1 20); do
+            if curl -sf -m 10 -x socks5h://127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace | grep -q 'warp=on'; then
+              echo "BMS_PROXY=socks5h://127.0.0.1:40000" >> "$GITHUB_ENV"; echo "WARP up"; exit 0
+            fi
+            sleep 3
+          done
+          echo "WARP failed; poll.py will fall back to the jina relay"
       - name: Test (no webhook)
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'test'
         run: python poll.py --test --extra "${{ inputs.extra }}"
@@ -37,7 +55,7 @@ jobs:
         if: (github.event_name == 'schedule' && vars.LIVE == '1') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live')
         env:
           WEBHOOK_KEY: ${{ secrets.WEBHOOK_KEY }}
-        run: python poll.py --duration 270 --interval 45
+        run: python poll.py --duration 230 --interval 45
       - name: Disable after successful POST
         if: steps.live.outputs.posted == 'true'
         env:
