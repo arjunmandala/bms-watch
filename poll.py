@@ -100,7 +100,11 @@ def is_english(lang):
 
 
 def is_dune_title(title):
-    return "dune" in (title or "").lower()
+    return title_matches(title, "dune")
+
+
+def title_matches(title, needle):
+    return (needle or "").lower() in (title or "").lower()
 
 
 def show_payload(child, show):
@@ -117,18 +121,20 @@ def show_payload(child, show):
     }
 
 
-def build_payload(date_code, shows):
-    return {
+def build_payload(date_code, shows, **extra):
+    body = {
         "source": "github",
         "event": "dune_show_listed",
         "venue": VENUE,
         "date": date_code,
         "shows": shows,
     }
+    body.update(extra)
+    return body
 
 
-def analyze(data, date_code):
-    """Open date + EventTitle containing 'dune' + English child events, any time/format."""
+def analyze(data, date_code, title_contains="dune"):
+    """Open date + EventTitle containing title_contains + English child events, any time/format."""
     dates = data.get("ShowDatesArray") or []
     open_flag = any(str(d.get("DateCode")) == date_code and d.get("isDisabled") is False for d in dates)
     details = data.get("ShowDetails") or []
@@ -138,8 +144,8 @@ def analyze(data, date_code):
     english, matches = 0, []
     for event in details[0].get("Event") or []:
         title = event.get("EventTitle") or ""
-        if not is_dune_title(title):
-            # Child EventName can differ; still require the parent title to look like Dune.
+        if not title_matches(title, title_contains):
+            # Child EventName can differ; still require the parent title to match.
             continue
         for child in event.get("ChildEvents") or []:
             lang = child.get("EventLanguage") or ""
@@ -189,41 +195,93 @@ def write_output(**kwargs):
 
 
 def post_webhook(body, key, retries=4):
+    """POST the webhook. Returns (ok, http_status_or_None). Does not retry 401/403."""
     data = json.dumps(body).encode()
+    last_status = None
     for attempt in range(1, retries + 1):
         try:
             req = urllib.request.Request(WEBHOOK_URL, data=data, method="POST", headers={
                 "Authorization": f"Bearer {key}", "Content-Type": "application/json", "Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=15) as resp:
-                log(f"webhook POST status={resp.getcode()} attempt={attempt}")
-                if 200 <= resp.getcode() < 300:
-                    return True
+                last_status = resp.getcode()
+                log(f"webhook POST status={last_status} attempt={attempt}")
+                if 200 <= last_status < 300:
+                    return True, last_status
         except urllib.error.HTTPError as exc:
-            log(f"webhook POST failed attempt={attempt} status={exc.code}")
+            last_status = exc.code
+            log(f"webhook POST failed attempt={attempt} status={last_status}")
+            if last_status in (401, 403):
+                log("webhook rejected the key (401/403); not retrying")
+                return False, last_status
         except Exception as exc:
             log(f"webhook POST failed attempt={attempt} {type(exc).__name__}")
-        time.sleep(2 ** attempt)
-    return False
+        if attempt < retries:
+            time.sleep(2 ** attempt)
+    return False, last_status
+
+
+DRILL_DATE = "20261219"
+DRILL_TITLE = "Avengers: Doomsday"
+DRILL_MOVIE = "Avengers: Doomsday"
+
+
+def run_drill(session_box, key):
+    """One-shot end-to-end alert drill. Never reads or writes fired_dates state."""
+    log(f"DRILL start date={DRILL_DATE} movie={DRILL_MOVIE!r} (no state touch)")
+    status, data = fetch(session_box, DRILL_DATE)
+    if data.get("_error"):
+        log(f"DRILL fetch error status={status} {data['_error']}")
+        print("WEBHOOK_HTTP_STATUS none")
+        write_output(webhook_status="none", drill_posted="false")
+        return 1
+    a = analyze(data, DRILL_DATE, title_contains=DRILL_TITLE)
+    returned = None
+    det = data.get("ShowDetails") or []
+    if det:
+        returned = det[0].get("Date")
+    log(
+        f"DRILL {DRILL_DATE} status={status} route={LAST_ROUTE[0]} "
+        f"returned_date={returned} open={a['open']} matches={len(a['matches'])}"
+    )
+    if not a["matches"]:
+        log("DRILL no English Avengers: Doomsday shows found; not posting")
+        print("WEBHOOK_HTTP_STATUS none")
+        write_output(webhook_status="none", drill_posted="false")
+        return 1
+    body = build_payload(DRILL_DATE, a["matches"], drill=True, movie=DRILL_MOVIE)
+    log("DRILL PAYLOAD " + json.dumps(body))
+    ok, http_status = post_webhook(body, key, retries=4)
+    printed = "none" if http_status is None else str(http_status)
+    print(f"WEBHOOK_HTTP_STATUS {printed}")
+    log(f"DRILL webhook status={printed} ok={ok}")
+    write_output(webhook_status=printed, drill_posted="true" if ok else "false")
+    if http_status in (401, 403):
+        log("DRILL: webhook rejected WEBHOOK_KEY (wrong or stale key); not retrying with any other secret")
+        return 1
+    return 0 if ok else 1
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--test", action="store_true", help="no POST; fetch dates and print would-be payloads")
+    ap.add_argument("--drill", action="store_true", help="POST a real drill alert for Avengers: Doomsday on 20261219; does not touch fired_dates")
     ap.add_argument("--extra", default="", help="comma-separated extra dates for test mode")
     ap.add_argument("--duration", type=float, default=270, help="seconds to keep polling")
     ap.add_argument("--interval", type=float, default=45)
     args = ap.parse_args()
 
-    if now_ist() >= STOP_AT and not args.test:
+    if now_ist() >= STOP_AT and not args.test and not args.drill:
         log("past Sun 20 Dec 2026 23:59 IST, nothing to do")
         write_output(all_fired="true")
         return 0
     key = os.environ.get("WEBHOOK_KEY", "").strip()
     if not args.test and not key:
-        log("WEBHOOK_KEY secret missing; refusing to run live")
+        log("WEBHOOK_KEY secret missing; refusing to run live or drill")
         return 2
 
     sb = [new_session()]
+    if args.drill:
+        return run_drill(sb, key)
     if args.test:
         dates = TARGET_DATES + [d for d in args.extra.split(",") if d]
         summary = {}
@@ -297,7 +355,8 @@ def main():
                 continue
             body = build_payload(d, a["matches"])
             log("MATCH " + json.dumps(body))
-            if post_webhook(body, key):
+            ok, _status = post_webhook(body, key)
+            if ok:
                 fired.add(d)
                 save_fired(fired)
                 write_output(posted="true", posted_date=d)

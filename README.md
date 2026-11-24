@@ -8,3 +8,5 @@ GitHub Actions poller for BookMyShow English *Dune: Part Three* shows at Allu Ci
 - Scheduled hourly (`cron: '7 * * * *'`) only polls when repo variable `LIVE=1`. Each live run also self-chains the next one, because GitHub cron can skip hours.
 - Polls BMS via Cloudflare WARP on GitHub runners, with the jina relay as fallback (BMS 403s GitHub IPs).
 - Webhook URL is in `poll.py`. The key is the `WEBHOOK_KEY` repo secret. Never commit the key.
+
+- `workflow_dispatch` mode `drill` is an end-to-end alert test: it looks up English *Avengers: Doomsday* at ALUC on 19 Dec 2026 and, if found, POSTs the real webhook with the same payload shape plus `"drill": true` and `"movie": "Avengers: Doomsday"`. Drill uses a separate concurrency group, does not read or write `fired_dates` on `watch-state`, and does not chain or disable the live watcher.

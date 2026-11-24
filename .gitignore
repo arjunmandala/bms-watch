@@ -1,2 +1,3 @@
 .fired-dates.json
 .fired-dates.json.tmp
+__pycache__/

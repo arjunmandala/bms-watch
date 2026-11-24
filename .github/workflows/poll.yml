@@ -5,15 +5,16 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'test (no POST) or live'
+        description: 'test (no POST), live, or drill (Avengers webhook, no state)'
         default: 'test'
         type: choice
-        options: [test, live]
+        options: [test, live, drill]
       extra:
         description: 'extra dates for test mode, comma-separated'
         default: ''
+# Drill uses its own group so it can run beside a live poll and cannot cancel or queue it.
 concurrency:
-  group: bms-poll
+  group: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'drill') && 'bms-drill' || 'bms-poll' }}
   cancel-in-progress: false
 permissions:
   actions: write
@@ -24,6 +25,7 @@ jobs:
     timeout-minutes: 125
     steps:
       - name: Stop after Sun 20 Dec 2026 23:59 IST
+        if: github.event_name != 'workflow_dispatch' || inputs.mode != 'drill'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -32,6 +34,7 @@ jobs:
           fi
       - uses: actions/checkout@v4
       - name: Restore fired-dates state
+        if: github.event_name != 'workflow_dispatch' || inputs.mode != 'drill'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -47,7 +50,7 @@ jobs:
           echo "RESTORED_FROM_BRANCH=$RESTORED" >> "$GITHUB_ENV"
           echo "current state:"; cat .fired-dates.json
       - uses: actions/cache/restore@v4
-        if: env.RESTORED_FROM_BRANCH != '1'
+        if: (github.event_name != 'workflow_dispatch' || inputs.mode != 'drill') && env.RESTORED_FROM_BRANCH != '1'
         continue-on-error: true
         with:
           path: .fired-dates.json
@@ -80,6 +83,12 @@ jobs:
       - name: Test (no webhook)
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'test'
         run: python poll.py --test --extra "${{ inputs.extra }}"
+      - name: Drill (Avengers webhook, no state)
+        id: drill
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'drill'
+        env:
+          WEBHOOK_KEY: ${{ secrets.WEBHOOK_KEY }}
+        run: python poll.py --drill
       - name: Live poll
         id: live
         if: (github.event_name == 'schedule' && vars.LIVE == '1') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live')
