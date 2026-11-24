@@ -17,20 +17,43 @@ concurrency:
   cancel-in-progress: false
 permissions:
   actions: write
-  contents: read
+  contents: write
 jobs:
   poll:
     runs-on: ubuntu-latest
     timeout-minutes: 125
     steps:
-      - name: Stop after Sun 15 Nov 2026 15:00 IST
+      - name: Stop after Sun 20 Dec 2026 23:59 IST
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$(date +%s)" -ge 1794735000 ]; then
+          if [ "$(date +%s)" -ge 1797791340 ]; then
             gh workflow disable poll.yml --repo "${{ github.repository }}"; echo "past stop time, disabled"; exit 1
           fi
       - uses: actions/checkout@v4
+      - name: Restore fired-dates state
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo '{"fired_dates":[]}' > .fired-dates.json
+          RESTORED=0
+          if git fetch origin watch-state:watch-state 2>/dev/null; then
+            if git show watch-state:fired-dates.json > .fired-dates.json 2>/dev/null; then
+              echo "restored from watch-state branch"
+              RESTORED=1
+            fi
+          fi
+          echo "RESTORED_FROM_BRANCH=$RESTORED" >> "$GITHUB_ENV"
+          echo "current state:"; cat .fired-dates.json
+      - uses: actions/cache/restore@v4
+        if: env.RESTORED_FROM_BRANCH != '1'
+        continue-on-error: true
+        with:
+          path: .fired-dates.json
+          key: dune-fired-dates-v1-${{ github.run_id }}
+          restore-keys: |
+            dune-fired-dates-v1-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -63,17 +86,54 @@ jobs:
         env:
           WEBHOOK_KEY: ${{ secrets.WEBHOOK_KEY }}
         run: python poll.py --duration 6900 --interval 45
-      - name: Disable after successful POST
-        if: steps.live.outputs.posted == 'true'
+      - name: Persist fired-dates state
+        if: always() && ((github.event_name == 'schedule' && vars.LIVE == '1') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if [ ! -f .fired-dates.json ]; then echo "no state file"; exit 0; fi
+          echo "persisting state:"; cat .fired-dates.json
+          cp .fired-dates.json /tmp/fired-dates.json
+          WORKDIR=$(mktemp -d)
+          ORIGIN="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          if git ls-remote --heads origin watch-state | grep -q watch-state; then
+            git clone --branch watch-state --single-branch "$ORIGIN" "$WORKDIR"
+          else
+            git clone --single-branch "$ORIGIN" "$WORKDIR"
+            git -C "$WORKDIR" checkout --orphan watch-state
+            git -C "$WORKDIR" rm -rf --ignore-unmatch . >/dev/null 2>&1 || true
+          fi
+          git -C "$WORKDIR" config user.name "bms-watch bot"
+          git -C "$WORKDIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp /tmp/fired-dates.json "$WORKDIR/fired-dates.json"
+          git -C "$WORKDIR" add fired-dates.json
+          if git -C "$WORKDIR" diff --staged --quiet; then
+            echo "state unchanged"
+          else
+            git -C "$WORKDIR" commit -m "record fired Dune dates"
+            git -C "$WORKDIR" push origin HEAD:watch-state
+            echo "state pushed to watch-state"
+          fi
+          cp /tmp/fired-dates.json .fired-dates.json
+      - name: Save fired-dates cache
+        if: always() && ((github.event_name == 'schedule' && vars.LIVE == '1') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live'))
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .fired-dates.json
+          key: dune-fired-dates-v1-${{ github.run_id }}
+      - name: Disable after all watched dates have fired
+        if: steps.live.outputs.all_fired == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow disable poll.yml --repo "${{ github.repository }}"
       - name: Chain next live run (GitHub cron is unreliable)
-        if: always() && steps.live.outputs.posted != 'true' && ((github.event_name == 'schedule' && vars.LIVE == '1') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live'))
+        if: always() && steps.live.outputs.all_fired != 'true' && ((github.event_name == 'schedule' && vars.LIVE == '1') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live'))
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$(date +%s)" -ge 1794735000 ]; then echo "past stop time"; exit 0; fi
+          if [ "$(date +%s)" -ge 1797791340 ]; then echo "past stop time"; exit 0; fi
           if [ "${{ steps.live.outcome }}" != "success" ]; then sleep 120; fi
           gh workflow run poll.yml --repo "${{ github.repository }}" -f mode=live
           echo "next run dispatched"
