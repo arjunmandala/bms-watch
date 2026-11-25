@@ -94,7 +94,9 @@ jobs:
         if: (github.event_name == 'schedule' && vars.LIVE == '1') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live')
         env:
           WEBHOOK_KEY: ${{ secrets.WEBHOOK_KEY }}
-        run: python poll.py --duration 6900 --interval 45
+          # Dune at Prasads is already listed; keep those listing alerts from re-firing if state is wiped.
+          FIRED_PAIRS: dune:20261219,dune:20261220
+        run: python poll.py --duration 6900 --interval 75
       - name: Persist fired-dates state
         if: always() && ((github.event_name == 'schedule' && vars.LIVE == '1') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live'))
         env:
@@ -115,6 +117,7 @@ jobs:
           fi
           git -C "$WORKDIR" config user.name "bms-watch bot"
           git -C "$WORKDIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 merge_state.py /tmp/fired-dates.json "$WORKDIR/fired-dates.json"
           cp /tmp/fired-dates.json "$WORKDIR/fired-dates.json"
           git -C "$WORKDIR" add fired-dates.json
           if git -C "$WORKDIR" diff --staged --quiet; then

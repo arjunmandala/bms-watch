@@ -6,12 +6,15 @@
 2. English Avengers: Doomsday at Allu Cinemas Kokapet (ALUC), 2D only
    (format / attributes must not contain '3D').
 
-Fires the automations webhook once per (movie, date). Seats are not checked.
+Fires the automations webhook once per (movie, date). Also watches seat
+maps for English Dune on the Prasads PCX screen and, once listed, English
+2D Avengers at Allu, alerting on 3 adjacent seats in a configured zone.
 """
 import argparse, json, os, random, sys, time, urllib.error, urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from curl_cffi.requests import Session
+import seats
 
 IST = ZoneInfo("Asia/Kolkata")
 STOP_AT = datetime(2026, 12, 20, 23, 59, tzinfo=IST)
@@ -36,6 +39,16 @@ TARGETS = [
         "dates": ["20261219", "20261220"],
         "format": "2d_only",
     },
+]
+
+# Seeded PCX Dune shows; each cycle also rediscovers any new PCX Screen 6 English Dune shows.
+KNOWN_DUNE_PCX = [
+    {"venue": "PRHN", "event_code": "ET00491771", "session_id": "259425",
+     "date": "20261219", "time": "11:05 AM", "screen": "SCREEN 6 (PCX Screen)",
+     "movie": "Dune: Part Three", "kind": "dune_pcx"},
+    {"venue": "PRHN", "event_code": "ET00491771", "session_id": "259431",
+     "date": "20261220", "time": "11:05 AM", "screen": "SCREEN 6 (PCX Screen)",
+     "movie": "Dune: Part Three", "kind": "dune_pcx"},
 ]
 
 DRILL_DATE = "20261219"
@@ -97,6 +110,14 @@ def _get(session, route, url):
     if route == "jina":
         return session.get("https://r.jina.ai/" + url, timeout=40, headers={"x-no-cache": "true"})
     return session.get(url, timeout=20)
+
+
+def _post(session, route, url, data, headers):
+    """POST is not relayed through jina."""
+    kwargs = {"timeout": 30, "data": data, "headers": headers}
+    if route == "warp":
+        kwargs["proxies"] = {"http": PROXY, "https": PROXY}
+    return session.post(url, **kwargs)
 
 
 def fetch(session_box, venue, date_code):
@@ -163,6 +184,7 @@ def show_payload(child, show):
         "max_price": show.get("MaxPrice"),
         "session_id": show.get("SessionId"),
         "event_code": child.get("EventCode"),
+        "attributes": show.get("Attributes") or "",
     }
 
 
@@ -209,31 +231,162 @@ def pair_key(movie_id, date_code):
     return f"{movie_id}:{date_code}"
 
 
-def load_fired():
-    """Return a set of 'movie_id:YYYYMMDD'. Legacy fired_dates (Allu Dune) are ignored."""
+
+def load_state():
+    """Return (fired_pairs set, seat_alerts dict). Legacy fired_dates are ignored."""
     fired = set()
     extra = os.environ.get("FIRED_PAIRS", "").strip()
     if extra:
         fired.update(p.strip() for p in extra.split(",") if p.strip())
+    alerts = {}
     try:
         with open(STATE_PATH) as f:
             data = json.load(f)
         fired.update(str(p) for p in (data.get("fired_pairs") or []))
+        alerts = data.get("seat_alerts") or {}
+        if not isinstance(alerts, dict):
+            alerts = {}
     except FileNotFoundError:
         pass
     except Exception as exc:
         log(f"could not read {STATE_PATH}: {type(exc).__name__}")
-    return fired
+    return fired, alerts
 
 
-def save_fired(fired):
-    payload = {"fired_pairs": sorted(fired), "updated": now_ist().isoformat(timespec="seconds")}
+def save_state(fired, seat_alerts):
+    payload = {
+        "fired_pairs": sorted(fired),
+        "seat_alerts": seat_alerts,
+        "updated": now_ist().isoformat(timespec="seconds"),
+    }
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w") as f:
         json.dump(payload, f)
         f.write("\n")
     os.replace(tmp, STATE_PATH)
-    log(f"saved state {STATE_PATH} fired_pairs={sorted(fired)}")
+    log(f"saved state {STATE_PATH} fired_pairs={sorted(fired)} seat_shows={sorted(seat_alerts)}")
+
+
+def load_fired():
+    fired, _ = load_state()
+    return fired
+
+
+def save_fired(fired):
+    _, alerts = load_state()
+    save_state(fired, alerts)
+
+
+def fetch_seat_layout(session_box, venue, session_id, event_code, date_code):
+    """GETSEATLAYOUT via WARP then direct. Does not call INITTRANS or ADDSEATS."""
+    url = seats.SEAT_LAYOUT_URL
+    data = seats.trans_form(venue, session_id)
+    headers = seats.trans_headers(venue, session_id, event_code, date_code)
+    routes = (["warp"] if PROXY else []) + ["direct"]
+    last, status = None, None
+    for attempt in range(2):
+        for route in routes:
+            status = None
+            try:
+                resp = _post(session_box[0], route, url, data, headers)
+                status = resp.status_code
+                if status != 200:
+                    raise ValueError(f"HTTP {status}")
+                layout = seats.decode_layout_payload(resp.text or "")
+                LAST_ROUTE[0] = route
+                return status, layout, None
+            except Exception as exc:
+                last = f"route={route} status={status} {type(exc).__name__}: {str(exc)[:160]}"
+                log(f"{venue} {session_id} seat fetch failed {last}")
+                try:
+                    session_box[0].close()
+                except Exception:
+                    pass
+                session_box[0] = new_session()
+        if attempt < 1:
+            time.sleep(random.uniform(2, 5))
+    return status, None, last
+
+
+def session_key(sess):
+    return f"{sess['venue']}:{sess['session_id']}"
+
+
+def discover_seat_sessions(session_box):
+    """Known PCX Dune sessions plus any new PRHN PCX English Dune, plus ALUC Avengers 2D."""
+    found = {}
+    for sess in KNOWN_DUNE_PCX:
+        found[session_key(sess)] = dict(sess)
+    for t in TARGETS:
+        for d in t["dates"]:
+            status, data = fetch(session_box, t["venue"], d)
+            if data.get("_error"):
+                log(f"discover {t['venue']} {d} error {data['_error']}")
+                continue
+            a = analyze(data, d, t["title_contains"], t["format"])
+            for m in a.get("matches") or []:
+                if not m.get("session_id"):
+                    continue
+                if t["id"] == "dune" and not seats.is_pcx_show(m):
+                    continue
+                kind = "dune_pcx" if t["id"] == "dune" else "avengers_2d"
+                rec = {
+                    "venue": t["venue"],
+                    "event_code": m.get("event_code"),
+                    "session_id": str(m.get("session_id")),
+                    "date": d,
+                    "time": m.get("time"),
+                    "screen": m.get("screen"),
+                    "movie": t["movie"],
+                    "kind": kind,
+                    "format": m.get("format"),
+                }
+                found[session_key(rec)] = rec
+    return list(found.values())
+
+
+def zone_for(sess, layout):
+    if sess.get("kind") == "dune_pcx":
+        return seats.dune_pcx_zone()
+    return seats.equivalent_zone(layout)
+
+
+def inspect_seats(session_box, sess):
+    status, layout, err = fetch_seat_layout(
+        session_box, sess["venue"], sess["session_id"], sess["event_code"], sess["date"]
+    )
+    if err or layout is None:
+        return {"ok": False, "error": err, "status": status, "blocks": [], "zone": None, "layout": None}
+    zone = zone_for(sess, layout)
+    blocks = seats.find_blocks(layout, zone)
+    return {"ok": True, "error": None, "status": status, "blocks": blocks, "zone": zone, "layout": layout}
+
+
+def seats_opened_payload(sess, zone, blocks, fresh=None):
+    return {
+        "source": "github",
+        "event": "seats_opened",
+        "movie": sess["movie"],
+        "venue": sess["venue"],
+        "date": sess["date"],
+        "session_id": sess["session_id"],
+        "event_code": sess["event_code"],
+        "time": sess.get("time"),
+        "screen": sess.get("screen"),
+        "zone": zone.get("label") if zone else None,
+        "blocks": blocks,
+        "new_blocks": fresh if fresh is not None else blocks,
+    }
+
+
+def remaining_work(fired, needed, sessions, now=None):
+    if any(p not in fired for p in needed):
+        return True
+    now = now or now_ist()
+    for sess in sessions:
+        if not seats.past_showtime(sess.get("date"), sess.get("time"), now):
+            return True
+    return False
 
 
 def write_output(**kwargs):
@@ -272,7 +425,7 @@ def post_webhook(body, key, retries=4):
 
 
 def run_drill(session_box, key):
-    """One-shot end-to-end alert drill. Never reads or writes fired_pairs state."""
+    """One-shot end-to-end alert drill. Never reads or writes fired_pairs or seat_alerts."""
     log(f"DRILL start venue={DRILL_VENUE} date={DRILL_DATE} movie={DRILL_MOVIE!r} (no state touch)")
     status, data = fetch(session_box, DRILL_VENUE, DRILL_DATE)
     if data.get("_error"):
@@ -347,9 +500,40 @@ def run_test(session_box, extra_dates):
     print("TEST_SUMMARY " + json.dumps(summary))
     print("WOULD_BE_PAYLOADS " + json.dumps(would))
     if not would:
-        log("no matching shows yet; no webhook would be posted")
+        log("no matching listing shows; no listing webhook would be posted")
         print("WOULD_BE_PAYLOAD_EXAMPLE " + json.dumps(EXAMPLE_PAYLOAD))
-    # exercise every route against the first target date (positive control)
+
+    sessions = discover_seat_sessions(session_box)
+    seat_reports = []
+    for sess in sessions:
+        if seats.past_showtime(sess.get("date"), sess.get("time")):
+            log(f"SEAT skip past showtime {session_key(sess)} {sess.get('time')}")
+            continue
+        info = inspect_seats(session_box, sess)
+        zone = info.get("zone") or {}
+        rec = {
+            "session": session_key(sess),
+            "date": sess.get("date"),
+            "time": sess.get("time"),
+            "movie": sess.get("movie"),
+            "screen": sess.get("screen"),
+            "kind": sess.get("kind"),
+            "ok": info["ok"],
+            "error": info["error"],
+            "route": LAST_ROUTE[0] if info["ok"] else None,
+            "zone": zone.get("label"),
+            "blocks": info["blocks"],
+        }
+        if info["ok"] and info.get("layout"):
+            rec["row_summary"] = seats.layout_summary(info["layout"], zone)
+        seat_reports.append(rec)
+        log("SEAT_TEST " + json.dumps(rec, default=str))
+        if info["blocks"]:
+            log("WOULD_BE_SEATS_PAYLOAD " + json.dumps(seats_opened_payload(sess, zone, info["blocks"])))
+        else:
+            log(f"SEAT_TEST no qualifying blocks for {session_key(sess)} zone={zone.get('label')}")
+    print("SEAT_TEST_SUMMARY " + json.dumps(seat_reports, default=str))
+
     ctrl_t, ctrl_d = TARGETS[0], (extra_dates[0] if extra_dates else TARGETS[0]["dates"][0])
     url = f"https://in.bookmyshow.com/api/v2/mobile/showtimes/byvenue?venueCode={ctrl_t['venue']}&dateCode={ctrl_d}"
     for route in (["warp"] if PROXY else []) + ["direct", "jina"]:
@@ -359,26 +543,36 @@ def run_test(session_box, extra_dates):
             log(f"ROUTE {route} {ctrl_t['venue']} {ctrl_d}: status={resp.status_code} open={a.get('open')} matches={len(a.get('matches') or [])}")
         except Exception as exc:
             log(f"ROUTE {route} {ctrl_t['venue']} {ctrl_d}: {type(exc).__name__}: {str(exc)[:160]}")
-    ok = all(v["status"] == 200 and not v["error"] for v in summary.values())
-    return 0 if ok else 1
+    listing_ok = all(v["status"] == 200 and not v["error"] for v in summary.values())
+    seats_ok = all(r["ok"] for r in seat_reports) if seat_reports else False
+    return 0 if listing_ok and seats_ok else 1
 
 
 def run_live(session_box, key, duration, interval):
-    fired = load_fired()
+    fired, seat_alerts = load_state()
     needed = {pair_key(mid, d) for mid, d in all_pairs()}
-    log(f"watching {sorted(needed)}; already fired={sorted(fired)}")
-    if needed <= fired:
-        log("all watched (movie, date) pairs already fired")
-        write_output(all_fired="true")
-        return 0
+    log(f"watching listings {sorted(needed)}; already fired={sorted(fired)}")
+    log(
+        f"Dune PCX zone: {seats.dune_pcx_zone()['label']}; "
+        f"Avengers 2D zone: back {seats.AVENGERS_BACK_FRAC:.0%} of rows, "
+        f"central {seats.AVENGERS_CENTER_FRAC:.0%} of seats"
+    )
 
     end = time.monotonic() + duration
     errors = 0
+    sessions = []
     while True:
-        if now_ist() >= STOP_AT:
+        now = now_ist()
+        if now >= STOP_AT:
             log("reached stop time")
-            write_output(all_fired="true" if needed <= fired else "false")
+            write_output(all_fired="true")
             return 0
+        try:
+            sessions = discover_seat_sessions(session_box)
+        except Exception as exc:
+            errors += 1
+            log(f"discover sessions failed {type(exc).__name__}: {str(exc)[:160]}")
+
         for t in TARGETS:
             for d in t["dates"]:
                 key_id = pair_key(t["id"], d)
@@ -400,29 +594,66 @@ def run_live(session_box, key, duration, interval):
                 ok, _status = post_webhook(body, key)
                 if ok:
                     fired.add(key_id)
-                    save_fired(fired)
+                    save_state(fired, seat_alerts)
                     write_output(posted="true", posted_pair=key_id)
-                    if needed <= fired:
-                        log("all watched (movie, date) pairs have fired")
-                        write_output(all_fired="true")
-                        return 0
-                    log(f"still watching {sorted(needed - fired)}")
+                    log(f"listing fired {key_id}; still watching seats")
                 else:
                     log("webhook POST failed after retries; will retry next loop")
-        if time.monotonic() + interval > end:
+
+        for sess in sessions:
+            sk = session_key(sess)
+            if seats.past_showtime(sess.get("date"), sess.get("time"), now):
+                log(f"SEAT skip past showtime {sk}")
+                continue
+            info = inspect_seats(session_box, sess)
+            if not info["ok"]:
+                errors += 1
+                log(f"SEAT {sk} error {info['error']}")
+                continue
+            zone = info["zone"] or {}
+            blocks = info["blocks"]
+            log(
+                f"SEAT {sk} status={info['status']} route={LAST_ROUTE[0]} "
+                f"zone={zone.get('label')} blocks={len(blocks)}"
+            )
+            fire, fresh = seats.should_alert(blocks, seat_alerts.get(sk))
+            if not fire:
+                continue
+            body = seats_opened_payload(sess, zone, blocks, fresh)
+            log("SEATS_OPENED " + json.dumps(body))
+            ok, _status = post_webhook(body, key)
+            if ok:
+                prev = set((seat_alerts.get(sk) or {}).get("block_ids") or [])
+                prev.update(seats.block_ids(fresh))
+                seat_alerts[sk] = {
+                    "block_ids": sorted(prev),
+                    "last_alert_at": now_ist().isoformat(timespec="seconds"),
+                    "zone": zone.get("label"),
+                }
+                save_state(fired, seat_alerts)
+                write_output(posted="true", posted_seats=sk)
+            else:
+                log("seats webhook POST failed after retries; will retry later")
+
+        if not remaining_work(fired, needed, sessions, now):
+            log("no listing or seat work remaining")
+            write_output(all_fired="true")
+            return 0
+        if time.monotonic() + max(interval, 60) > end:
             break
-        time.sleep(interval + random.uniform(-5, 5))
-    write_output(all_fired="true" if needed <= fired else "false")
+        sleep_for = min(90, max(60, interval + random.uniform(-15, 15)))
+        time.sleep(sleep_for)
+    write_output(all_fired="true" if not remaining_work(fired, needed, sessions) else "false")
     return 1 if errors >= 6 else 0
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--test", action="store_true", help="no POST; fetch all targets and print would-be payloads")
-    ap.add_argument("--drill", action="store_true", help="POST a real drill alert for Avengers: Doomsday on 20261219 at ALUC; does not touch fired_pairs")
+    ap.add_argument("--test", action="store_true", help="no POST; fetch listings and seat maps")
+    ap.add_argument("--drill", action="store_true", help="POST a real drill alert for Avengers: Doomsday on 20261219 at ALUC; does not touch state")
     ap.add_argument("--extra", default="", help="comma-separated extra dates for test mode (applied to the first target)")
     ap.add_argument("--duration", type=float, default=270, help="seconds to keep polling")
-    ap.add_argument("--interval", type=float, default=45)
+    ap.add_argument("--interval", type=float, default=75)
     args = ap.parse_args()
 
     if now_ist() >= STOP_AT and not args.test and not args.drill:
