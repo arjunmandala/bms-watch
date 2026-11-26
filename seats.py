@@ -8,7 +8,7 @@ only decodes availability to alert; it never holds or books seats.
 """
 from __future__ import annotations
 
-import base64, json, os, time
+import base64, json, os, re, time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -39,9 +39,11 @@ DUNE_PCX_ROWS = os.environ.get("DUNE_PCX_ROWS", "H-N")
 DUNE_PCX_SEAT_MIN = int(os.environ.get("DUNE_PCX_SEAT_MIN", "10"))
 DUNE_PCX_SEAT_MAX = int(os.environ.get("DUNE_PCX_SEAT_MAX", "40"))
 SEAT_BLOCK_SIZE = int(os.environ.get("SEAT_BLOCK_SIZE", "3"))
-# Equivalent zone for Allu Avengers 2D once a layout exists.
+# Dolby Cinema (ALUC Screen 1) zone: back half of rows, then the middle
+# third of that half, central ~60% of those rows' seat numbers.
 AVENGERS_BACK_FRAC = float(os.environ.get("AVENGERS_BACK_FRAC", "0.5"))
 AVENGERS_CENTER_FRAC = float(os.environ.get("AVENGERS_CENTER_FRAC", "0.6"))
+AVENGERS_BACK_MID_FRAC = float(os.environ.get("AVENGERS_BACK_MID_FRAC", "0.333"))
 SEAT_ALERT_COOLDOWN_SEC = int(os.environ.get("SEAT_ALERT_COOLDOWN_SEC", str(15 * 60)))
 
 
@@ -118,13 +120,13 @@ def row_letter(row):
     return (row.get("row_number") or row.get("row_id") or "").strip().upper()
 
 
-def equivalent_zone(layout, back_frac=None, center_frac=None):
-    """Back ~half of rows (A is front), central ~center_frac of seat numbers."""
+def equivalent_zone(layout, back_frac=None, center_frac=None, mid_frac=None, seat_from_zone_rows=False):
+    """Back ~half of rows (A is front), optional middle slice of that half, central seats."""
     back_frac = AVENGERS_BACK_FRAC if back_frac is None else back_frac
     center_frac = AVENGERS_CENTER_FRAC if center_frac is None else center_frac
     letters = []
     seen = set()
-    nums = []
+    nums_by_row = {}
     for row in layout.get("rows") or []:
         letter = row_letter(row)
         if letter and letter not in seen and any(s.get("status") != 0 for s in row.get("seats") or []):
@@ -133,12 +135,23 @@ def equivalent_zone(layout, back_frac=None, center_frac=None):
         for s in row.get("seats") or []:
             n = display_num(s)
             if n is not None and s.get("status") != 0:
-                nums.append(n)
+                nums_by_row.setdefault(letter, []).append(n)
     letters_sorted = sorted(letters, key=lambda x: (len(x), x))
     if not letters_sorted:
         return {"rows": [], "seat_min": None, "seat_max": None, "label": "empty-layout"}
     start = int(len(letters_sorted) * (1.0 - back_frac))
     rows = letters_sorted[start:]
+    if mid_frac is not None and mid_frac < 1.0 and rows:
+        trim = (1.0 - mid_frac) / 2.0
+        i = int(round(len(rows) * trim))
+        j = int(round(len(rows) * (1.0 - trim)))
+        mid = rows[i:j]
+        if mid:
+            rows = mid
+    if seat_from_zone_rows:
+        nums = [n for letter in rows for n in nums_by_row.get(letter) or []]
+    else:
+        nums = [n for vals in nums_by_row.values() for n in vals]
     if nums:
         lo, hi = min(nums), max(nums)
         margin = (1.0 - center_frac) / 2.0 * (hi - lo)
@@ -148,6 +161,15 @@ def equivalent_zone(layout, back_frac=None, center_frac=None):
         seat_min = seat_max = None
     label = f"rows {rows[0]}-{rows[-1]}, seats {seat_min}-{seat_max}"
     return {"rows": rows, "seat_min": seat_min, "seat_max": seat_max, "label": label}
+
+
+def dolby_zone(layout):
+    """Middle third of the back half, central 60% of those rows — for ALUC Dolby Cinema."""
+    return equivalent_zone(
+        layout,
+        mid_frac=AVENGERS_BACK_MID_FRAC,
+        seat_from_zone_rows=True,
+    )
 
 
 def dune_pcx_zone():
@@ -270,13 +292,26 @@ def decode_layout_payload(payload):
     return parse_layout(decrypt_strdata(raw))
 
 
-def is_pcx_show(show):
-    screen = " ".join([
+def _show_screen_text(show):
+    return " ".join([
         str(show.get("screen") or ""),
         str(show.get("format") or ""),
         str(show.get("attributes") or ""),
     ]).lower()
-    return "pcx" in screen
+
+
+def is_pcx_show(show):
+    return "pcx" in _show_screen_text(show)
+
+
+def is_dolby_show(show):
+    """ALUC Dolby Cinema is Screen 1; BMS uses ScreenName 'SCREEN 1' and Attributes 'DOLBY CINEMA'."""
+    text = _show_screen_text(show)
+    if re.search(r"\bscreen\s*[234]\b", text):
+        return False
+    if "dolby" in text:
+        return True
+    return bool(re.search(r"\bscreen\s*1\b", text))
 
 
 def show_datetime(date_code, show_time):

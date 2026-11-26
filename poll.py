@@ -3,16 +3,14 @@
 
 1. English Dune: Part Three at Prasads Multiplex Hyderabad (PRHN), any format.
    Screen name (plus attributes) distinguishes the PCX screen from the others.
-2. English Avengers: Doomsday at Allu Cinemas Kokapet (ALUC), 2D only
-   (format / attributes must not contain '3D').
-3. English Avengers: Doomsday 2D only on the Prasads PCX Screen 6 (PRHN).
-   Non-PCX Prasads screens and any 3D format (including Infinity Vision 3D
-   on PCX) are ignored. Listing event is show_listed, once per date.
+2. English Avengers: Doomsday at Allu Cinemas Kokapet (ALUC), 2D only on the
+   Dolby Cinema screen (BMS ScreenName 'SCREEN 1', Attributes 'DOLBY CINEMA').
+   3D and Screens 2-4 are ignored. Listing event is show_listed, once per date.
 
 Fires the automations webhook once per (target id, date). Also watches seat
-maps for English Dune on the Prasads PCX screen, English 2D Avengers on that
-same PCX screen (same H-N / 10-40 zone), and once listed, English 2D
-Avengers at Allu (back half / central 60%).
+maps for English Dune on the Prasads PCX screen (rows H-N, seats 10-40) and,
+once listed, English 2D Avengers on Allu Dolby Cinema (middle third of the
+back half of rows, central 60% of those seats).
 """
 import argparse, json, os, random, sys, time, urllib.error, urllib.request
 from datetime import datetime
@@ -46,25 +44,14 @@ TARGETS = [
         "venue": "ALUC",
         "dates": ["20261219", "20261220"],
         "format": "2d_only",
-        "list_event": "dune_show_listed",
-        "seat_kind": "avengers_2d",
-        "zone": "equivalent",
-    },
-    {
-        "id": "avengers_pcx",
-        "movie": "Avengers: Doomsday",
-        "title_contains": "avengers: doomsday",
-        "venue": "PRHN",
-        "dates": ["20261219", "20261220"],
-        "format": "2d_only",
-        "pcx_only": True,
+        "dolby_only": True,
         "list_event": "show_listed",
-        "seat_kind": "avengers_pcx",
-        "zone": "pcx",
+        "seat_kind": "avengers_dolby",
+        "zone": "dolby",
     },
 ]
 
-PCX_SEAT_KINDS = {"dune_pcx", "avengers_pcx"}
+PCX_SEAT_KINDS = {"dune_pcx"}
 SEAT_INTERVAL_MIN = 30
 SEAT_INTERVAL_MAX = 45
 
@@ -228,9 +215,17 @@ def build_payload(venue, date_code, shows, movie, event=None, **extra):
     return body
 
 
+def screen_pred(t):
+    if t.get("dolby_only"):
+        return seats.is_dolby_show
+    if t.get("pcx_only"):
+        return seats.is_pcx_show
+    return None
+
+
 def target_analyze(data, date_code, t):
     return analyze(
-        data, date_code, t["title_contains"], t["format"], pcx_only=bool(t.get("pcx_only")),
+        data, date_code, t["title_contains"], t["format"], screen_ok=screen_pred(t),
     )
 
 
@@ -242,8 +237,8 @@ def listings_cache(session_box):
     return cache
 
 
-def analyze(data, date_code, title_contains, format_mode="any", pcx_only=False):
-    """Open date + matching EventTitle + English child events, optional 2D-only / PCX filter."""
+def analyze(data, date_code, title_contains, format_mode="any", screen_ok=None, pcx_only=False):
+    """Open date + matching EventTitle + English child events, optional 2D / screen filter."""
     dates = data.get("ShowDatesArray") or []
     open_flag = any(str(d.get("DateCode")) == date_code and d.get("isDisabled") is False for d in dates)
     details = data.get("ShowDetails") or []
@@ -263,7 +258,8 @@ def analyze(data, date_code, title_contains, format_mode="any", pcx_only=False):
                 if format_mode == "2d_only" and is_3d_format(child, show):
                     continue
                 payload = show_payload(child, show)
-                if pcx_only and not seats.is_pcx_show(payload):
+                pred = screen_ok or (seats.is_pcx_show if pcx_only else None)
+                if pred and not pred(payload):
                     continue
                 english += 1
                 matches.append(payload)
@@ -357,7 +353,7 @@ def session_key(sess):
 
 
 def discover_seat_sessions(session_box, cache=None):
-    """Known PCX Dune sessions plus discovered PCX Dune, PRHN PCX Avengers 2D, and ALUC Avengers 2D."""
+    """Known PCX Dune sessions plus discovered PCX Dune and ALUC Dolby Avengers 2D."""
     found = {}
     for sess in KNOWN_DUNE_PCX:
         found[session_key(sess)] = dict(sess)
@@ -376,7 +372,9 @@ def discover_seat_sessions(session_box, cache=None):
                 # Dune listings include non-PCX screens; only PCX is seat-watched.
                 if (t.get("zone") == "pcx" or t["id"] == "dune") and not seats.is_pcx_show(m):
                     continue
-                kind = t.get("seat_kind") or ("dune_pcx" if t["id"] == "dune" else "avengers_2d")
+                if (t.get("dolby_only") or t.get("zone") == "dolby") and not seats.is_dolby_show(m):
+                    continue
+                kind = t.get("seat_kind") or ("dune_pcx" if t["id"] == "dune" else "avengers_dolby")
                 rec = {
                     "venue": t["venue"],
                     "event_code": m.get("event_code"),
@@ -387,7 +385,7 @@ def discover_seat_sessions(session_box, cache=None):
                     "movie": t["movie"],
                     "kind": kind,
                     "format": m.get("format"),
-                    "zone": t.get("zone") or ("pcx" if kind in PCX_SEAT_KINDS else "equivalent"),
+                    "zone": t.get("zone") or ("pcx" if kind in PCX_SEAT_KINDS else "dolby"),
                 }
                 found[session_key(rec)] = rec
     return list(found.values())
@@ -396,6 +394,8 @@ def discover_seat_sessions(session_box, cache=None):
 def zone_for(sess, layout):
     if sess.get("kind") in PCX_SEAT_KINDS or sess.get("zone") == "pcx":
         return seats.dune_pcx_zone()
+    if sess.get("kind") == "avengers_dolby" or sess.get("zone") == "dolby":
+        return seats.dolby_zone(layout)
     return seats.equivalent_zone(layout)
 
 
@@ -508,38 +508,6 @@ def run_drill(session_box, key):
     return 0 if ok else 1
 
 
-def run_drill_avengers_pcx(session_box, key):
-    """One-shot show_listed drill for Avengers 2D on PRHN PCX. Never touches state."""
-    t = next(x for x in TARGETS if x["id"] == "avengers_pcx")
-    log(f"DRILL_PCX start venue={t['venue']} dates={t['dates']} (no state touch)")
-    shows_by_date = {}
-    for d in t["dates"]:
-        status, data = fetch(session_box, t["venue"], d)
-        if data.get("_error"):
-            log(f"DRILL_PCX fetch error {d} status={status} {data['_error']}")
-            shows_by_date[d] = {"error": data["_error"], "matches": []}
-            continue
-        a = target_analyze(data, d, t)
-        shows_by_date[d] = {"error": None, "matches": a["matches"], "open": a["open"]}
-        log(f"DRILL_PCX {t['venue']} {d} status={status} route={LAST_ROUTE[0]} matches={len(a['matches'])}")
-    # Prefer a real 2D PCX listing if one exists; otherwise post a marked webhook check.
-    date_code = next((d for d in t["dates"] if shows_by_date[d]["matches"]), t["dates"][0])
-    matches = shows_by_date[date_code]["matches"]
-    body = build_payload(t["venue"], date_code, matches, t["movie"], event=t["list_event"], drill=True)
-    if not matches:
-        body["note"] = "drill only; no English 2D Avengers on PCX Screen 6 is listed yet"
-    log("DRILL_PCX PAYLOAD " + json.dumps(body))
-    ok, http_status = post_webhook(body, key, retries=4)
-    printed = "none" if http_status is None else str(http_status)
-    print(f"WEBHOOK_HTTP_STATUS {printed}")
-    log(f"DRILL_PCX webhook status={printed} ok={ok}")
-    write_output(webhook_status=printed, drill_posted="true" if ok else "false")
-    if http_status in (401, 403):
-        log("DRILL_PCX: webhook rejected WEBHOOK_KEY; not retrying with any other secret")
-        return 1
-    return 0 if ok else 1
-
-
 def run_test(session_box, extra_dates):
     summary = {}
     would = []
@@ -636,9 +604,11 @@ def run_live(session_box, key, duration, interval):
     needed = {pair_key(mid, d) for mid, d in all_pairs()}
     log(f"watching listings {sorted(needed)}; already fired={sorted(fired)}")
     log(
-        f"Dune / Avengers PCX zone: {seats.dune_pcx_zone()['label']}; "
-        f"Avengers 2D at Allu zone: back {seats.AVENGERS_BACK_FRAC:.0%} of rows, "
-        f"central {seats.AVENGERS_CENTER_FRAC:.0%} of seats"
+        f"Dune PCX zone: {seats.dune_pcx_zone()['label']}; "
+        f"Avengers Dolby zone: middle {seats.AVENGERS_BACK_MID_FRAC:.0%} of the "
+        f"back {seats.AVENGERS_BACK_FRAC:.0%} of rows, "
+        f"central {seats.AVENGERS_CENTER_FRAC:.0%} of those seats "
+        f"(computed from the layout when 2D lists)"
     )
     log(f"seat poll interval {SEAT_INTERVAL_MIN}-{SEAT_INTERVAL_MAX}s (requested {interval})")
 
@@ -740,13 +710,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--test", action="store_true", help="no POST; fetch listings and seat maps")
     ap.add_argument("--drill", action="store_true", help="POST a real drill alert for Avengers: Doomsday on 20261219 at ALUC; does not touch state")
-    ap.add_argument("--drill-avengers-pcx", action="store_true", help="POST a drill show_listed alert for Avengers 2D on PRHN PCX; does not touch state")
     ap.add_argument("--extra", default="", help="comma-separated extra dates for test mode (applied to the first target)")
     ap.add_argument("--duration", type=float, default=270, help="seconds to keep polling")
     ap.add_argument("--interval", type=float, default=35)
     args = ap.parse_args()
 
-    if now_ist() >= STOP_AT and not args.test and not args.drill and not args.drill_avengers_pcx:
+    if now_ist() >= STOP_AT and not args.test and not args.drill:
         log("past Sun 20 Dec 2026 23:59 IST, nothing to do")
         write_output(all_fired="true")
         return 0
@@ -758,8 +727,6 @@ def main():
     sb = [new_session()]
     if args.drill:
         return run_drill(sb, key)
-    if args.drill_avengers_pcx:
-        return run_drill_avengers_pcx(sb, key)
     if args.test:
         extra = [d for d in args.extra.split(",") if d]
         return run_test(sb, extra)
