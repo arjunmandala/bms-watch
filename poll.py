@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""GitHub Actions poller for two BookMyShow targets on Sat 19 / Sun 20 Dec 2026:
+"""GitHub Actions poller for BookMyShow targets on Sat 19 / Sun 20 Dec 2026:
 
 1. English Dune: Part Three at Prasads Multiplex Hyderabad (PRHN), any format.
    Screen name (plus attributes) distinguishes the PCX screen from the others.
 2. English Avengers: Doomsday at Allu Cinemas Kokapet (ALUC), 2D only
    (format / attributes must not contain '3D').
+3. English Avengers: Doomsday 2D only on the Prasads PCX Screen 6 (PRHN).
+   Non-PCX Prasads screens and any 3D format (including Infinity Vision 3D
+   on PCX) are ignored. Listing event is show_listed, once per date.
 
-Fires the automations webhook once per (movie, date). Also watches seat
-maps for English Dune on the Prasads PCX screen and, once listed, English
-2D Avengers at Allu, alerting on 3 adjacent seats in a configured zone.
+Fires the automations webhook once per (target id, date). Also watches seat
+maps for English Dune on the Prasads PCX screen, English 2D Avengers on that
+same PCX screen (same H-N / 10-40 zone), and once listed, English 2D
+Avengers at Allu (back half / central 60%).
 """
 import argparse, json, os, random, sys, time, urllib.error, urllib.request
 from datetime import datetime
@@ -30,6 +34,10 @@ TARGETS = [
         "venue": "PRHN",
         "dates": ["20261219", "20261220"],
         "format": "any",
+        "list_event": "dune_show_listed",
+        "seat_kind": "dune_pcx",
+        "zone": "pcx",
+        # listings include every English format/screen; seat watch is PCX only
     },
     {
         "id": "avengers",
@@ -38,8 +46,27 @@ TARGETS = [
         "venue": "ALUC",
         "dates": ["20261219", "20261220"],
         "format": "2d_only",
+        "list_event": "dune_show_listed",
+        "seat_kind": "avengers_2d",
+        "zone": "equivalent",
+    },
+    {
+        "id": "avengers_pcx",
+        "movie": "Avengers: Doomsday",
+        "title_contains": "avengers: doomsday",
+        "venue": "PRHN",
+        "dates": ["20261219", "20261220"],
+        "format": "2d_only",
+        "pcx_only": True,
+        "list_event": "show_listed",
+        "seat_kind": "avengers_pcx",
+        "zone": "pcx",
     },
 ]
+
+PCX_SEAT_KINDS = {"dune_pcx", "avengers_pcx"}
+SEAT_INTERVAL_MIN = 30
+SEAT_INTERVAL_MAX = 45
 
 # Seeded PCX Dune shows; each cycle also rediscovers any new PCX Screen 6 English Dune shows.
 KNOWN_DUNE_PCX = [
@@ -188,10 +215,10 @@ def show_payload(child, show):
     }
 
 
-def build_payload(venue, date_code, shows, movie, **extra):
+def build_payload(venue, date_code, shows, movie, event=None, **extra):
     body = {
         "source": "github",
-        "event": "dune_show_listed",
+        "event": event or "dune_show_listed",
         "venue": venue,
         "date": date_code,
         "movie": movie,
@@ -201,8 +228,22 @@ def build_payload(venue, date_code, shows, movie, **extra):
     return body
 
 
-def analyze(data, date_code, title_contains, format_mode="any"):
-    """Open date + matching EventTitle + English child events, optional 2D-only filter."""
+def target_analyze(data, date_code, t):
+    return analyze(
+        data, date_code, t["title_contains"], t["format"], pcx_only=bool(t.get("pcx_only")),
+    )
+
+
+def listings_cache(session_box):
+    """Fetch each (venue, date) once per cycle."""
+    cache = {}
+    for venue, d in sorted({(t["venue"], d) for t in TARGETS for d in t["dates"]}):
+        cache[(venue, d)] = fetch(session_box, venue, d)
+    return cache
+
+
+def analyze(data, date_code, title_contains, format_mode="any", pcx_only=False):
+    """Open date + matching EventTitle + English child events, optional 2D-only / PCX filter."""
     dates = data.get("ShowDatesArray") or []
     open_flag = any(str(d.get("DateCode")) == date_code and d.get("isDisabled") is False for d in dates)
     details = data.get("ShowDetails") or []
@@ -221,8 +262,11 @@ def analyze(data, date_code, title_contains, format_mode="any"):
             for show in child.get("ShowTimes") or []:
                 if format_mode == "2d_only" and is_3d_format(child, show):
                     continue
+                payload = show_payload(child, show)
+                if pcx_only and not seats.is_pcx_show(payload):
+                    continue
                 english += 1
-                matches.append(show_payload(child, show))
+                matches.append(payload)
     matches.sort(key=lambda m: (str(m.get("time") or ""), str(m.get("screen") or ""), str(m.get("format") or "")))
     return {"open": True, "english": english, "matches": matches}
 
@@ -312,24 +356,27 @@ def session_key(sess):
     return f"{sess['venue']}:{sess['session_id']}"
 
 
-def discover_seat_sessions(session_box):
-    """Known PCX Dune sessions plus any new PRHN PCX English Dune, plus ALUC Avengers 2D."""
+def discover_seat_sessions(session_box, cache=None):
+    """Known PCX Dune sessions plus discovered PCX Dune, PRHN PCX Avengers 2D, and ALUC Avengers 2D."""
     found = {}
     for sess in KNOWN_DUNE_PCX:
         found[session_key(sess)] = dict(sess)
+    if cache is None:
+        cache = listings_cache(session_box)
     for t in TARGETS:
         for d in t["dates"]:
-            status, data = fetch(session_box, t["venue"], d)
+            status, data = cache.get((t["venue"], d), (None, {"_error": "missing cache"}))
             if data.get("_error"):
                 log(f"discover {t['venue']} {d} error {data['_error']}")
                 continue
-            a = analyze(data, d, t["title_contains"], t["format"])
+            a = target_analyze(data, d, t)
             for m in a.get("matches") or []:
                 if not m.get("session_id"):
                     continue
-                if t["id"] == "dune" and not seats.is_pcx_show(m):
+                # Dune listings include non-PCX screens; only PCX is seat-watched.
+                if (t.get("zone") == "pcx" or t["id"] == "dune") and not seats.is_pcx_show(m):
                     continue
-                kind = "dune_pcx" if t["id"] == "dune" else "avengers_2d"
+                kind = t.get("seat_kind") or ("dune_pcx" if t["id"] == "dune" else "avengers_2d")
                 rec = {
                     "venue": t["venue"],
                     "event_code": m.get("event_code"),
@@ -340,13 +387,14 @@ def discover_seat_sessions(session_box):
                     "movie": t["movie"],
                     "kind": kind,
                     "format": m.get("format"),
+                    "zone": t.get("zone") or ("pcx" if kind in PCX_SEAT_KINDS else "equivalent"),
                 }
                 found[session_key(rec)] = rec
     return list(found.values())
 
 
 def zone_for(sess, layout):
-    if sess.get("kind") == "dune_pcx":
+    if sess.get("kind") in PCX_SEAT_KINDS or sess.get("zone") == "pcx":
         return seats.dune_pcx_zone()
     return seats.equivalent_zone(layout)
 
@@ -460,6 +508,38 @@ def run_drill(session_box, key):
     return 0 if ok else 1
 
 
+def run_drill_avengers_pcx(session_box, key):
+    """One-shot show_listed drill for Avengers 2D on PRHN PCX. Never touches state."""
+    t = next(x for x in TARGETS if x["id"] == "avengers_pcx")
+    log(f"DRILL_PCX start venue={t['venue']} dates={t['dates']} (no state touch)")
+    shows_by_date = {}
+    for d in t["dates"]:
+        status, data = fetch(session_box, t["venue"], d)
+        if data.get("_error"):
+            log(f"DRILL_PCX fetch error {d} status={status} {data['_error']}")
+            shows_by_date[d] = {"error": data["_error"], "matches": []}
+            continue
+        a = target_analyze(data, d, t)
+        shows_by_date[d] = {"error": None, "matches": a["matches"], "open": a["open"]}
+        log(f"DRILL_PCX {t['venue']} {d} status={status} route={LAST_ROUTE[0]} matches={len(a['matches'])}")
+    # Prefer a real 2D PCX listing if one exists; otherwise post a marked webhook check.
+    date_code = next((d for d in t["dates"] if shows_by_date[d]["matches"]), t["dates"][0])
+    matches = shows_by_date[date_code]["matches"]
+    body = build_payload(t["venue"], date_code, matches, t["movie"], event=t["list_event"], drill=True)
+    if not matches:
+        body["note"] = "drill only; no English 2D Avengers on PCX Screen 6 is listed yet"
+    log("DRILL_PCX PAYLOAD " + json.dumps(body))
+    ok, http_status = post_webhook(body, key, retries=4)
+    printed = "none" if http_status is None else str(http_status)
+    print(f"WEBHOOK_HTTP_STATUS {printed}")
+    log(f"DRILL_PCX webhook status={printed} ok={ok}")
+    write_output(webhook_status=printed, drill_posted="true" if ok else "false")
+    if http_status in (401, 403):
+        log("DRILL_PCX: webhook rejected WEBHOOK_KEY; not retrying with any other secret")
+        return 1
+    return 0 if ok else 1
+
+
 def run_test(session_box, extra_dates):
     summary = {}
     would = []
@@ -470,11 +550,14 @@ def run_test(session_box, extra_dates):
             dates += [d for d in extra_dates if d and d not in dates]
         for d in dates:
             queries.append((t, d))
+    cache = listings_cache(session_box)
     for t, d in queries:
+        if (t["venue"], d) not in cache:
+            cache[(t["venue"], d)] = fetch(session_box, t["venue"], d)
         label = f"{t['venue']}:{d}:{t['id']}"
-        status, data = fetch(session_box, t["venue"], d)
+        status, data = cache.get((t["venue"], d), (None, {"_error": "missing cache"}))
         err = data.get("_error")
-        a = analyze(data, d, t["title_contains"], t["format"]) if not err else {"open": False, "english": 0, "matches": []}
+        a = target_analyze(data, d, t) if not err else {"open": False, "english": 0, "matches": []}
         returned = None
         if not err:
             det = data.get("ShowDetails") or []
@@ -494,7 +577,7 @@ def run_test(session_box, extra_dates):
         }
         log(f"TEST {label}: {json.dumps(summary[label])}")
         if a["matches"]:
-            body = build_payload(t["venue"], d, a["matches"], t["movie"])
+            body = build_payload(t["venue"], d, a["matches"], t["movie"], event=t.get("list_event"))
             would.append(body)
             log("WOULD_BE_PAYLOAD " + json.dumps(body))
     print("TEST_SUMMARY " + json.dumps(summary))
@@ -503,7 +586,7 @@ def run_test(session_box, extra_dates):
         log("no matching listing shows; no listing webhook would be posted")
         print("WOULD_BE_PAYLOAD_EXAMPLE " + json.dumps(EXAMPLE_PAYLOAD))
 
-    sessions = discover_seat_sessions(session_box)
+    sessions = discover_seat_sessions(session_box, cache)
     seat_reports = []
     for sess in sessions:
         if seats.past_showtime(sess.get("date"), sess.get("time")):
@@ -539,7 +622,7 @@ def run_test(session_box, extra_dates):
     for route in (["warp"] if PROXY else []) + ["direct", "jina"]:
         try:
             resp = _get(new_session(), route, url)
-            a = analyze(_parse(resp.text), ctrl_d, ctrl_t["title_contains"], ctrl_t["format"]) if resp.status_code == 200 else {"open": None, "matches": []}
+            a = target_analyze(_parse(resp.text), ctrl_d, ctrl_t) if resp.status_code == 200 else {"open": None, "matches": []}
             log(f"ROUTE {route} {ctrl_t['venue']} {ctrl_d}: status={resp.status_code} open={a.get('open')} matches={len(a.get('matches') or [])}")
         except Exception as exc:
             log(f"ROUTE {route} {ctrl_t['venue']} {ctrl_d}: {type(exc).__name__}: {str(exc)[:160]}")
@@ -553,10 +636,11 @@ def run_live(session_box, key, duration, interval):
     needed = {pair_key(mid, d) for mid, d in all_pairs()}
     log(f"watching listings {sorted(needed)}; already fired={sorted(fired)}")
     log(
-        f"Dune PCX zone: {seats.dune_pcx_zone()['label']}; "
-        f"Avengers 2D zone: back {seats.AVENGERS_BACK_FRAC:.0%} of rows, "
+        f"Dune / Avengers PCX zone: {seats.dune_pcx_zone()['label']}; "
+        f"Avengers 2D at Allu zone: back {seats.AVENGERS_BACK_FRAC:.0%} of rows, "
         f"central {seats.AVENGERS_CENTER_FRAC:.0%} of seats"
     )
+    log(f"seat poll interval {SEAT_INTERVAL_MIN}-{SEAT_INTERVAL_MAX}s (requested {interval})")
 
     end = time.monotonic() + duration
     errors = 0
@@ -568,20 +652,22 @@ def run_live(session_box, key, duration, interval):
             write_output(all_fired="true")
             return 0
         try:
-            sessions = discover_seat_sessions(session_box)
+            cache = listings_cache(session_box)
+            sessions = discover_seat_sessions(session_box, cache)
         except Exception as exc:
             errors += 1
             log(f"discover sessions failed {type(exc).__name__}: {str(exc)[:160]}")
+            cache = {}
 
         for t in TARGETS:
             for d in t["dates"]:
                 key_id = pair_key(t["id"], d)
-                status, data = fetch(session_box, t["venue"], d)
+                status, data = cache.get((t["venue"], d), (None, {"_error": "missing cache"}))
                 if data.get("_error"):
                     errors += 1
                     log(f"{t['venue']} {d} {t['id']} fetch error {data['_error']}")
                     continue
-                a = analyze(data, d, t["title_contains"], t["format"])
+                a = target_analyze(data, d, t)
                 already = key_id in fired
                 log(
                     f"{t['venue']} {d} {t['id']} status={status} route={LAST_ROUTE[0]} "
@@ -589,7 +675,7 @@ def run_live(session_box, key, duration, interval):
                 )
                 if already or not a["matches"]:
                     continue
-                body = build_payload(t["venue"], d, a["matches"], t["movie"])
+                body = build_payload(t["venue"], d, a["matches"], t["movie"], event=t.get("list_event"))
                 log("MATCH " + json.dumps(body))
                 ok, _status = post_webhook(body, key)
                 if ok:
@@ -639,9 +725,12 @@ def run_live(session_box, key, duration, interval):
             log("no listing or seat work remaining")
             write_output(all_fired="true")
             return 0
-        if time.monotonic() + max(interval, 60) > end:
+        lo, hi = SEAT_INTERVAL_MIN, SEAT_INTERVAL_MAX
+        if time.monotonic() + lo > end:
             break
-        sleep_for = min(90, max(60, interval + random.uniform(-15, 15)))
+        # Tight 30-45s seat loop so a 1-minute window is not missed; jitter to ease blocking.
+        target = min(hi, max(lo, interval))
+        sleep_for = min(hi, max(lo, target + random.uniform(-5, 5)))
         time.sleep(sleep_for)
     write_output(all_fired="true" if not remaining_work(fired, needed, sessions) else "false")
     return 1 if errors >= 6 else 0
@@ -651,12 +740,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--test", action="store_true", help="no POST; fetch listings and seat maps")
     ap.add_argument("--drill", action="store_true", help="POST a real drill alert for Avengers: Doomsday on 20261219 at ALUC; does not touch state")
+    ap.add_argument("--drill-avengers-pcx", action="store_true", help="POST a drill show_listed alert for Avengers 2D on PRHN PCX; does not touch state")
     ap.add_argument("--extra", default="", help="comma-separated extra dates for test mode (applied to the first target)")
     ap.add_argument("--duration", type=float, default=270, help="seconds to keep polling")
-    ap.add_argument("--interval", type=float, default=75)
+    ap.add_argument("--interval", type=float, default=35)
     args = ap.parse_args()
 
-    if now_ist() >= STOP_AT and not args.test and not args.drill:
+    if now_ist() >= STOP_AT and not args.test and not args.drill and not args.drill_avengers_pcx:
         log("past Sun 20 Dec 2026 23:59 IST, nothing to do")
         write_output(all_fired="true")
         return 0
@@ -668,6 +758,8 @@ def main():
     sb = [new_session()]
     if args.drill:
         return run_drill(sb, key)
+    if args.drill_avengers_pcx:
+        return run_drill_avengers_pcx(sb, key)
     if args.test:
         extra = [d for d in args.extra.split(",") if d]
         return run_test(sb, extra)

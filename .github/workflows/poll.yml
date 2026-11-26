@@ -5,10 +5,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'test (no POST), live, or drill (Avengers webhook, no state)'
+        description: 'test (no POST), live, drill (ALUC Avengers webhook), or drill-pcx (PRHN PCX Avengers 2D webhook)'
         default: 'test'
         type: choice
-        options: [test, live, drill]
+        options: [test, live, drill, drill-pcx]
       extra:
         description: 'extra dates for test mode, comma-separated'
         default: ''
@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 125
     steps:
       - name: Stop after Sun 20 Dec 2026 23:59 IST
-        if: github.event_name != 'workflow_dispatch' || inputs.mode != 'drill'
+        if: github.event_name != 'workflow_dispatch' || (inputs.mode != 'drill' && inputs.mode != 'drill-pcx')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -34,7 +34,7 @@ jobs:
           fi
       - uses: actions/checkout@v4
       - name: Restore fired-dates state
-        if: github.event_name != 'workflow_dispatch' || inputs.mode != 'drill'
+        if: github.event_name != 'workflow_dispatch' || (inputs.mode != 'drill' && inputs.mode != 'drill-pcx')
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -50,7 +50,7 @@ jobs:
           echo "RESTORED_FROM_BRANCH=$RESTORED" >> "$GITHUB_ENV"
           echo "current state:"; cat .fired-dates.json
       - uses: actions/cache/restore@v4
-        if: (github.event_name != 'workflow_dispatch' || inputs.mode != 'drill') && env.RESTORED_FROM_BRANCH != '1'
+        if: (github.event_name != 'workflow_dispatch' || (inputs.mode != 'drill' && inputs.mode != 'drill-pcx')) && env.RESTORED_FROM_BRANCH != '1'
         continue-on-error: true
         with:
           path: .fired-dates.json
@@ -89,6 +89,12 @@ jobs:
         env:
           WEBHOOK_KEY: ${{ secrets.WEBHOOK_KEY }}
         run: python poll.py --drill
+      - name: Drill PCX (Avengers 2D show_listed webhook, no state)
+        id: drill_pcx
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'drill-pcx'
+        env:
+          WEBHOOK_KEY: ${{ secrets.WEBHOOK_KEY }}
+        run: python poll.py --drill-avengers-pcx
       - name: Live poll
         id: live
         if: (github.event_name == 'schedule' && vars.LIVE == '1') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live')
@@ -96,7 +102,7 @@ jobs:
           WEBHOOK_KEY: ${{ secrets.WEBHOOK_KEY }}
           # Dune at Prasads is already listed; keep those listing alerts from re-firing if state is wiped.
           FIRED_PAIRS: dune:20261219,dune:20261220
-        run: python poll.py --duration 6900 --interval 75
+        run: python poll.py --duration 6900 --interval 35
       - name: Persist fired-dates state
         if: always() && ((github.event_name == 'schedule' && vars.LIVE == '1') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live'))
         env:
